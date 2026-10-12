@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+python-multipart
+google-genai>=2,<3
+demucs==4.1.0
+python-dotenv
