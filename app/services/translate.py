@@ -1,14 +1,27 @@
 import json
+import shutil
 import subprocess
+import tempfile
+from pathlib import Path
 
 from app.core.pools import is_rate
 
 
 def parse_json_response(value: str) -> dict:
+    """
+    Parse JSON returned by Gemini.
+
+    Supports:
+    - Plain JSON
+    - JSON wrapped in Markdown fences
+    - Text containing a JSON object
+    """
     text = (value or "").strip()
 
     if not text:
-        raise ValueError("Gemini CLI trả response rỗng.")
+        raise ValueError(
+            "Gemini CLI trả response rỗng."
+        )
 
     if text.startswith("```"):
         lines = text.splitlines()
@@ -22,18 +35,48 @@ def parse_json_response(value: str) -> dict:
         text = "\n".join(lines).strip()
 
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        start = text.find("{")
-        end = text.rfind("}")
+        result = json.loads(text)
 
-        if start == -1 or end == -1 or end <= start:
+        if not isinstance(result, dict):
             raise ValueError(
-                "Không tìm thấy JSON object trong response: "
-                f"{text[:500]!r}"
+                "JSON response không phải object."
             )
 
-        return json.loads(text[start:end + 1])
+        return result
+
+    except json.JSONDecodeError:
+        object_start = text.find("{")
+        object_end = text.rfind("}")
+
+        if (
+            object_start == -1
+            or object_end == -1
+            or object_end <= object_start
+        ):
+            raise ValueError(
+                "Không tìm thấy JSON object trong response: "
+                f"{text[:1000]!r}"
+            )
+
+        json_text = text[
+            object_start:object_end + 1
+        ]
+
+        try:
+            result = json.loads(json_text)
+
+            if not isinstance(result, dict):
+                raise ValueError(
+                    "JSON response không phải object."
+                )
+
+            return result
+
+        except json.JSONDecodeError as exception:
+            raise ValueError(
+                "Tìm thấy JSON object nhưng không parse được: "
+                f"{json_text[:1000]!r}"
+            ) from exception
 
 
 class Translator:
@@ -47,124 +90,401 @@ class Translator:
         self.model = model
         self.cmd = cmd
 
-    def build_prompt(self, segments) -> str:
+    def resolve_cli_command(self) -> str:
+        """
+        Resolve Gemini CLI executable.
+
+        On Windows, npm normally installs gemini.cmd.
+        """
+        configured = str(
+            self.cmd or ""
+        ).strip()
+
+        if configured:
+            configured_path = Path(configured)
+
+            if configured_path.exists():
+                return str(
+                    configured_path.resolve()
+                )
+
+            resolved = shutil.which(configured)
+
+            if resolved:
+                return resolved
+
+        windows_command = shutil.which(
+            "gemini.cmd"
+        )
+
+        if windows_command:
+            return windows_command
+
+        normal_command = shutil.which(
+            "gemini"
+        )
+
+        if normal_command:
+            return normal_command
+
+        raise RuntimeError(
+            "Không tìm thấy Gemini CLI. "
+            "Hãy đặt GEMINI_CLI_COMMAND bằng đường dẫn đầy đủ "
+            "tới gemini.cmd. Ví dụ: "
+            "C:/Users/daole/AppData/Roaming/npm/gemini.cmd"
+        )
+
+    def build_payload(self, segments) -> str:
+        """
+        Keep translation payload small.
+
+        Translation does not need start/end timestamps.
+        """
         payload = [
-            segment.dict()
+            {
+                "id": segment.id,
+                "source": segment.source,
+            }
             for segment in segments
         ]
 
-        return f"""
-Bạn là biên tập viên phụ đề video ngắn.
+        instructions = {
+            "task": (
+                "Sửa lỗi transcript ASR và dịch từng segment "
+                "sang tiếng Việt tự nhiên."
+            ),
+            "rules": [
+                "Xử lý nhiệm vụ ngay, không xác nhận vai trò.",
+                "Giữ nguyên tất cả ID.",
+                "Không thay đổi số lượng segment.",
+                "Không bịa nội dung ngoài transcript.",
+                "Sửa source nếu ASR nhận sai theo ngữ cảnh.",
+                "Bản tiếng Việt phải ngắn và dễ đọc bằng TTS.",
+                "Không nhắc đến source code hoặc dự án.",
+                "Không giải thích.",
+                "Không sử dụng Markdown.",
+                "Chỉ trả một JSON object hợp lệ.",
+            ],
+            "output_schema": {
+                "segments": [
+                    {
+                        "id": 0,
+                        "source_fixed": (
+                            "Nguyên văn đã sửa"
+                        ),
+                        "vi": (
+                            "Bản dịch tiếng Việt"
+                        ),
+                    }
+                ]
+            },
+            "segments": payload,
+        }
 
-Transcript bên dưới có thể bị nhận dạng sai do:
-- nhạc nền
-- lời hát
-- từ đồng âm
-- nhiều ngôn ngữ
-- lỗi ASR
+        return json.dumps(
+            instructions,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
 
-Nhiệm vụ:
-1. Hiểu toàn bộ ngữ cảnh.
-2. Sửa lại nguyên văn nếu ASR nhận sai.
-3. Dịch sang tiếng Việt tự nhiên.
-4. Viết câu tiếng Việt ngắn, dễ đọc bằng TTS.
-5. Giữ nguyên ID.
-6. Không bịa thêm nội dung.
+    def build_short_prompt(self) -> str:
+        return (
+            "Đọc JSON từ stdin và thực hiện trường task ngay. "
+            "Không xác nhận vai trò, không chào hỏi. "
+            "Sửa lỗi ASR và dịch từng segment sang tiếng Việt. "
+            "Chỉ trả JSON đúng output_schema trong stdin. "
+            "Không dùng Markdown hoặc code fence."
+        )
 
-Chỉ trả về JSON hợp lệ, không giải thích,
-không dùng Markdown và không dùng code fence.
+    @staticmethod
+    def is_invalid_key(message: str) -> bool:
+        value = message.lower()
 
-Cấu trúc bắt buộc:
+        markers = (
+            "api_key_invalid",
+            "api key not valid",
+            "invalid api key",
+            "unauthenticated",
+            "permission_denied",
+        )
 
-{{
-  "segments": [
-    {{
-      "id": 0,
-      "source_fixed": "Nguyên văn đã sửa",
-      "vi": "Bản dịch tiếng Việt"
-    }}
-  ]
-}}
+        return any(
+            marker in value
+            for marker in markers
+        )
 
-Dữ liệu:
+    def run_cli(
+        self,
+        cli_command: str,
+        key: str,
+        payload: str,
+    ) -> subprocess.CompletedProcess:
+        command = [
+            cli_command,
+            "--model",
+            self.model,
+            "--prompt",
+            self.build_short_prompt(),
+            "--output-format",
+            "json",
+        ]
 
-{json.dumps(payload, ensure_ascii=False)}
-""".strip()
+        print("=" * 70)
+        print(
+            "[TRANSLATE] Command:",
+            cli_command,
+        )
+        print(
+            "[TRANSLATE] Model:",
+            self.model,
+        )
+        print(
+            "[TRANSLATE] Payload length:",
+            len(payload),
+        )
+        print(
+            "[TRANSLATE] Payload preview:",
+            repr(payload[:1000]),
+        )
+        print("=" * 70)
+
+        environment = self.pool.env(key)
+
+        # Prevent another authentication variable from
+        # overriding the selected translation key.
+        environment.pop(
+            "GOOGLE_API_KEY",
+            None,
+        )
+
+        environment["GEMINI_API_KEY"] = (
+            key.strip()
+            .strip('"')
+            .strip("'")
+        )
+
+        environment["NO_COLOR"] = "1"
+
+        with tempfile.TemporaryDirectory(
+            prefix="dv-video-translate-"
+        ) as temporary_directory:
+            return subprocess.run(
+                command,
+                input=payload,
+                cwd=temporary_directory,
+                env=environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=300,
+            )
+
+    def apply_translation(
+        self,
+        segments,
+        translated_data: dict,
+    ):
+        translated_items = translated_data.get(
+            "segments",
+            [],
+        )
+
+        if not isinstance(
+            translated_items,
+            list,
+        ):
+            raise ValueError(
+                "Gemini trả JSON nhưng trường "
+                "'segments' không phải array."
+            )
+
+        translated_by_id = {}
+
+        for item in translated_items:
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                item_id = int(item["id"])
+            except (
+                KeyError,
+                TypeError,
+                ValueError,
+            ):
+                continue
+
+            translated_by_id[item_id] = item
+
+        if not translated_by_id:
+            raise ValueError(
+                "Gemini trả JSON nhưng không có "
+                "segment ID hợp lệ."
+            )
+
+        missing_ids = []
+
+        for segment in segments:
+            item = translated_by_id.get(
+                segment.id
+            )
+
+            if item is None:
+                missing_ids.append(
+                    segment.id
+                )
+                continue
+
+            source_fixed = str(
+                item.get(
+                    "source_fixed",
+                    "",
+                )
+            ).strip()
+
+            vietnamese = str(
+                item.get(
+                    "vi",
+                    "",
+                )
+            ).strip()
+
+            if source_fixed:
+                segment.source = source_fixed
+
+            segment.vi = vietnamese
+
+        if missing_ids:
+            raise ValueError(
+                "Gemini không trả đủ segment. "
+                f"Thiếu ID: {missing_ids}"
+            )
+
+        empty_translation_ids = [
+            segment.id
+            for segment in segments
+            if not segment.vi.strip()
+        ]
+
+        if empty_translation_ids:
+            raise ValueError(
+                "Một số segment không có bản dịch tiếng Việt. "
+                f"ID: {empty_translation_ids}"
+            )
+
+        return segments
 
     def run(self, segments):
-        prompt = self.build_prompt(segments)
+        if not segments:
+            raise ValueError(
+                "Không có segment để dịch."
+            )
+
+        cli_command = (
+            self.resolve_cli_command()
+        )
+
+        payload = self.build_payload(
+            segments
+        )
 
         tried = set()
         last_error = None
 
-        while len(tried) < len(self.pool.keys):
+        while len(tried) < len(
+            self.pool.keys
+        ):
             index, key = self.pool.take(
                 self.model,
                 tried,
             )
-            tried.add(index)
 
-            command = [
-                self.cmd,
-                "--model",
-                self.model,
-                "--prompt",
-                prompt,
-                "--output-format",
-                "json",
-            ]
+            tried.add(index)
 
             print("=" * 70)
             print(
-                f"TRANSLATE model={self.model} "
+                f"[TRANSLATE] "
+                f"model={self.model} "
                 f"key_slot={index + 1}"
             )
             print("=" * 70)
 
             try:
-                process = subprocess.run(
-                    command,
-                    env=self.pool.env(key),
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=300,
+                process = self.run_cli(
+                    cli_command=cli_command,
+                    key=key,
+                    payload=payload,
                 )
+
             except subprocess.TimeoutExpired as exception:
-                last_error = exception
+                print(
+                    "[TRANSLATE] Timeout:",
+                    repr(exception),
+                )
 
                 self.pool.suspend(
                     self.model,
                     index,
                     "CLI timeout",
                 )
+
+                last_error = exception
                 continue
+
             except FileNotFoundError as exception:
                 raise RuntimeError(
-                    "Không tìm thấy lệnh 'gemini'. "
-                    "Kiểm tra Gemini CLI đã được cài và có trong PATH."
+                    "Không tìm thấy Gemini CLI. "
+                    f"Command={cli_command!r}"
                 ) from exception
 
-            stdout = (process.stdout or "").strip()
-            stderr = (process.stderr or "").strip()
+            stdout = (
+                process.stdout or ""
+            ).strip()
 
-            print("RETURN CODE:", process.returncode)
-            print("STDOUT:", repr(stdout[:2000]))
-            print("STDERR:", repr(stderr[:2000]))
+            stderr = (
+                process.stderr or ""
+            ).strip()
+
+            print(
+                "[TRANSLATE] Return code:",
+                process.returncode,
+            )
+
+            print(
+                "[TRANSLATE] STDOUT:",
+                repr(stdout[:3000]),
+            )
+
+            print(
+                "[TRANSLATE] STDERR:",
+                repr(stderr[:3000]),
+            )
 
             combined = "\n".join(
                 value
-                for value in [stdout, stderr]
+                for value in (
+                    stdout,
+                    stderr,
+                )
                 if value
             )
 
             if process.returncode != 0:
-                reason = (
-                    "429/quota"
-                    if is_rate(combined)
-                    else f"CLI exit {process.returncode}"
-                )
+                if is_rate(combined):
+                    reason = "429/quota"
+
+                elif self.is_invalid_key(
+                    combined
+                ):
+                    reason = (
+                        "invalid API key"
+                    )
+
+                else:
+                    reason = (
+                        "CLI exit "
+                        f"{process.returncode}"
+                    )
 
                 self.pool.suspend(
                     self.model,
@@ -175,46 +495,69 @@ Dữ liệu:
                 last_error = RuntimeError(
                     combined or reason
                 )
+
                 continue
 
             if not stdout:
+                last_error = ValueError(
+                    "Gemini CLI kết thúc thành công "
+                    "nhưng stdout bị rỗng. "
+                    f"stderr={stderr[:2000]!r}"
+                )
+
+                # Đây có thể là lỗi CLI tạm thời,
+                # nên cooldown slot.
                 self.pool.suspend(
                     self.model,
                     index,
-                    "empty stdout",
+                    "empty CLI stdout",
                 )
 
-                last_error = ValueError(
-                    "Gemini CLI kết thúc thành công "
-                    "nhưng stdout bị rỗng."
-                )
                 continue
 
             try:
-                envelope = parse_json_response(stdout)
+                envelope = (
+                    parse_json_response(
+                        stdout
+                    )
+                )
+
             except Exception as exception:
-                self.pool.suspend(
-                    self.model,
-                    index,
-                    "invalid CLI envelope",
+                print(
+                    "[TRANSLATE] "
+                    "CLI envelope không hợp lệ:",
+                    repr(stdout[:3000]),
                 )
 
                 last_error = exception
+
+                # Không treo key chỉ vì output format sai.
                 continue
 
-            cli_error = envelope.get("error")
+            cli_error = envelope.get(
+                "error"
+            )
 
             if cli_error:
-                cli_error_text = json.dumps(
+                error_text = json.dumps(
                     cli_error,
                     ensure_ascii=False,
                 )
 
-                reason = (
-                    "429/quota"
-                    if is_rate(cli_error_text)
-                    else "CLI response error"
-                )
+                if is_rate(error_text):
+                    reason = "429/quota"
+
+                elif self.is_invalid_key(
+                    error_text
+                ):
+                    reason = (
+                        "invalid API key"
+                    )
+
+                else:
+                    reason = (
+                        "CLI response error"
+                    )
 
                 self.pool.suspend(
                     self.model,
@@ -223,91 +566,66 @@ Dữ liệu:
                 )
 
                 last_error = RuntimeError(
-                    cli_error_text
+                    error_text
                 )
+
                 continue
 
-            answer = envelope.get("response")
+            answer = envelope.get(
+                "response"
+            )
 
-            if not isinstance(answer, str) or not answer.strip():
-                self.pool.suspend(
-                    self.model,
-                    index,
-                    "empty model response",
-                )
-
+            if (
+                not isinstance(answer, str)
+                or not answer.strip()
+            ):
                 last_error = ValueError(
                     "Gemini CLI envelope không có "
                     "trường response hợp lệ. "
-                    f"Envelope: {envelope}"
+                    f"Envelope={envelope!r}"
                 )
+
+                continue
+
+            print(
+                "[TRANSLATE] Model response:",
+                repr(answer[:3000]),
+            )
+
+            try:
+                translated_data = (
+                    parse_json_response(
+                        answer
+                    )
+                )
+
+            except Exception as exception:
+                print(
+                    "[TRANSLATE] Model trả sai định dạng:",
+                    repr(answer[:3000]),
+                )
+
+                last_error = exception
+
+                # Không cooldown key vì model không tuân thủ JSON
+                # không có nghĩa credential bị lỗi.
                 continue
 
             try:
-                translated_data = parse_json_response(
-                    answer
+                return self.apply_translation(
+                    segments,
+                    translated_data,
                 )
+
             except Exception as exception:
-                self.pool.suspend(
-                    self.model,
-                    index,
-                    "invalid translation JSON",
+                print(
+                    "[TRANSLATE] JSON hợp lệ "
+                    "nhưng dữ liệu không hợp lệ:",
+                    repr(translated_data),
                 )
 
                 last_error = exception
                 continue
-
-            translated_items = (
-                translated_data.get("segments", [])
-            )
-
-            if not isinstance(translated_items, list):
-                self.pool.suspend(
-                    self.model,
-                    index,
-                    "segments is not a list",
-                )
-
-                last_error = ValueError(
-                    "Gemini trả JSON nhưng segments "
-                    "không phải array."
-                )
-                continue
-
-            translated_by_id = {}
-
-            for item in translated_items:
-                try:
-                    item_id = int(item["id"])
-                except (
-                    KeyError,
-                    TypeError,
-                    ValueError,
-                ):
-                    continue
-
-                translated_by_id[item_id] = item
-
-            for segment in segments:
-                item = translated_by_id.get(
-                    segment.id,
-                    {},
-                )
-
-                source_fixed = str(
-                    item.get("source_fixed", "")
-                ).strip()
-
-                vietnamese = str(
-                    item.get("vi", "")
-                ).strip()
-
-                if source_fixed:
-                    segment.source = source_fixed
-
-                segment.vi = vietnamese
-
-            return segments
 
         raise RuntimeError(
             "Không còn translation key khả dụng. "
